@@ -28,6 +28,58 @@ vsg::ref_ptr<vsg::Camera> createCameraForScene(vsg::Node* scenegraph, int32_t x,
     return vsg::Camera::create(perspective, lookAt, viewportstate);
 }
 
+class ViewHandler : public vsg::Inherit<vsg::Visitor, ViewHandler>
+{
+public:
+
+    vsg::ref_ptr<vsg::RenderGraph> renderGraph;
+
+    ViewHandler(vsg::ref_ptr<vsg::RenderGraph> in_renderGrah) : renderGraph(in_renderGrah) {}
+
+    void apply(vsg::KeyPressEvent& keyPress) override
+    {
+        if (keyPress.keyBase == 's')
+        {
+            std::vector<std::pair<size_t, vsg::ref_ptr<vsg::View>>> views;
+            for(size_t i  = 0; i < renderGraph->children.size(); ++i)
+            {
+                if (auto view = renderGraph->children[i].cast<vsg::View>()) views.emplace_back(i, view);
+            }
+
+            if (views.size()<2) return;
+
+            auto renderPass = renderGraph->getRenderPass();
+            if (!renderPass) return;
+
+            auto view0 = views[0].second;
+            auto viewport0 = view0->camera->getViewport();
+            VkExtent2D extent0{ static_cast<uint32_t>(viewport0.width), static_cast<uint32_t>(viewport0.height)};
+
+            auto view1 = views[1].second;
+            auto viewport1 = view1->camera->getViewport();
+            VkExtent2D extent1{ static_cast<uint32_t>(viewport1.width), static_cast<uint32_t>(viewport1.height)};
+
+            // swap rendering order by swap the view entries in the renderGraph->children
+            std::swap(renderGraph->children[views[0].first], renderGraph->children[views[1].first]);
+            std::swap(views[0].second->camera->viewportState, views[1].second->camera->viewportState);
+
+            // change the aspect ratios of the projection matrices to fit the new diemensions.
+            view0->camera->projectionMatrix->changeExtent(extent0, extent1);
+            view1->camera->projectionMatrix->changeExtent(extent1, extent0);
+
+            // wait until the device is idle to avoid changing state while it's being used.
+            vkDeviceWaitIdle(*(renderPass->device));
+
+            vsg::UpdateGraphicsPipelines updateGraphicsPipelines;
+
+            updateGraphicsPipelines.context = vsg::Context::create(renderPass->device);
+            updateGraphicsPipelines.context->renderPass = renderPass;
+
+            renderGraph->accept(updateGraphicsPipelines);
+        }
+    }
+};
+
 int main(int argc, char** argv)
 {
     // set up defaults and read command line arguments to override them
@@ -38,8 +90,6 @@ int main(int argc, char** argv)
     windowTraits->debugLayer = arguments.read({"--debug", "-d"});
     windowTraits->apiDumpLayer = arguments.read({"--api", "-a"});
     if (arguments.read({"--window", "-w"}, windowTraits->width, windowTraits->height)) { windowTraits->fullscreen = false; }
-
-    bool separateRenderGraph = arguments.read("-s");
 
     if (arguments.errors()) return arguments.writeErrorMessages(std::cerr);
 
@@ -101,46 +151,33 @@ int main(int argc, char** argv)
     viewer->addEventHandler(vsg::Trackball::create(secondary_camera));
     viewer->addEventHandler(vsg::Trackball::create(main_camera));
 
-    if (separateRenderGraph)
-    {
-        std::cout << "Using a RenderGraph per View" << std::endl;
-        auto main_RenderGraph = vsg::RenderGraph::create(window, main_view);
-        auto secondary_RenderGraph = vsg::RenderGraph::create(window, secondary_view);
-        secondary_RenderGraph->clearValues[0].color = {{0.2f, 0.2f, 0.2f, 1.0f}};
+    auto renderGraph = vsg::RenderGraph::create(window);
 
-        auto commandGraph = vsg::CommandGraph::create(window);
-        commandGraph->addChild(main_RenderGraph);
-        commandGraph->addChild(secondary_RenderGraph);
+    // add main view that covers the whole window.
+    renderGraph->addChild(main_view);
 
-        viewer->assignRecordAndSubmitTaskAndPresentation({commandGraph});
-    }
-    else
-    {
-        std::cout << "Using a single RenderGraph, with both Views separated by a ClearAttachments" << std::endl;
-        auto renderGraph = vsg::RenderGraph::create(window);
+    // clear the depth buffer before view2 gets rendered
+    VkClearValue colorClearValue{};
+    colorClearValue.color = {{0.2f, 0.2f, 0.2f, 1.0f}};
+    VkClearAttachment color_attachment{VK_IMAGE_ASPECT_COLOR_BIT, 0, colorClearValue};
 
-        renderGraph->addChild(main_view);
+    VkClearValue depthClearValue{};
+    depthClearValue.depthStencil = {0.0f, 0};
+    VkClearAttachment depth_attachment{VK_IMAGE_ASPECT_DEPTH_BIT, 1, depthClearValue};
 
-        // clear the depth buffer before view2 gets rendered
+    VkClearRect rect{secondary_camera->getRenderArea(), 0, 1};
+    auto clearAttachments = vsg::ClearAttachments::create(vsg::ClearAttachments::Attachments{color_attachment, depth_attachment}, vsg::ClearAttachments::Rects{rect, rect});
+    renderGraph->addChild(clearAttachments);
 
-        VkClearValue colorClearValue{};
-        colorClearValue.color = {{0.2f, 0.2f, 0.2f, 1.0f}};
-        VkClearAttachment color_attachment{VK_IMAGE_ASPECT_COLOR_BIT, 0, colorClearValue};
+    // add the second insert view that overlays ontop.
+    renderGraph->addChild(secondary_view);
 
-        VkClearValue depthClearValue{};
-        depthClearValue.depthStencil = {0.0f, 0};
-        VkClearAttachment depth_attachment{VK_IMAGE_ASPECT_DEPTH_BIT, 1, depthClearValue};
+    auto commandGraph = vsg::CommandGraph::create(window);
+    commandGraph->addChild(renderGraph);
+    viewer->assignRecordAndSubmitTaskAndPresentation({commandGraph});
 
-        VkClearRect rect{secondary_camera->getRenderArea(), 0, 1};
-        auto clearAttachments = vsg::ClearAttachments::create(vsg::ClearAttachments::Attachments{color_attachment, depth_attachment}, vsg::ClearAttachments::Rects{rect, rect});
-        renderGraph->addChild(clearAttachments);
-
-        renderGraph->addChild(secondary_view);
-
-        auto commandGraph = vsg::CommandGraph::create(window);
-        commandGraph->addChild(renderGraph);
-        viewer->assignRecordAndSubmitTaskAndPresentation({commandGraph});
-    }
+    // add the view handler for interactively changing the views
+    viewer->addEventHandler(ViewHandler::create(renderGraph));
 
     viewer->compile();
 

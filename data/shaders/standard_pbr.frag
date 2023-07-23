@@ -105,6 +105,7 @@ float pow5(const in float value)
 // or from the interpolated mesh normal and tangent attributes.
 vec3 getNormal()
 {
+    vec3 result;
 #ifdef VSG_NORMAL_MAP
     // Perturb normal, see http://www.thetenthplanet.de/archives/1180
     vec3 tangentNormal = texture(normalMap, texCoord0).xyz * 2.0 - 1.0;
@@ -121,10 +122,15 @@ vec3 getNormal()
     vec3 B = -normalize(cross(N, T));
     mat3 TBN = mat3(T, B, N);
 
-    return normalize(TBN * tangentNormal);
+    result = normalize(TBN * tangentNormal);
 #else
-    return normalize(normalDir);
+    result = normalize(normalDir);
 #endif
+#ifdef VSG_TWO_SIDED_LIGHTING
+    if (!gl_FrontFacing)
+        result = -result;
+#endif
+    return result;
 }
 
 // Basic Lambertian diffuse
@@ -230,14 +236,6 @@ vec3 BRDF(vec3 u_LightColor, vec3 v, vec3 n, vec3 l, vec3 h, float perceptualRou
 {
     float unclmapped_NdotL = dot(n, l);
 
-    #ifdef VSG_TWO_SIDED_LIGHTING
-    if (unclmapped_NdotL < 0.0)
-    {
-        n = -n;
-        unclmapped_NdotL = -unclmapped_NdotL;
-    }
-    #endif
-
     vec3 reflection = -normalize(reflect(v, n));
     reflection.y *= -1.0f;
 
@@ -338,8 +336,9 @@ void main()
     #endif
 
     #ifdef VSG_SPECULAR_MAP
-        vec3 specular = SRGBtoLINEAR(texture(specularMap, texCoord0)).rgb;
-        perceptualRoughness = 1.0 - texture(specularMap, texCoord0).a;
+        vec4 specular_texel = texture(specularMap, texCoord0);
+        vec3 specular = SRGBtoLINEAR(specular_texel).rgb;
+        perceptualRoughness = 1.0 - specular_texel.a;
     #else
         vec3 specular = vec3(0.0);
         perceptualRoughness = 0.0;
